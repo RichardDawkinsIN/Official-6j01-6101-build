@@ -1,0 +1,329 @@
+name: JioRouter ImageBuilder Build
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+  push:
+    # इस फाइल का सही नाम यहाँ लिखें
+    paths: ['.github/workflows/jiorouter-imagebuilder.yml', 'packages/pkg.sh']
+
+permissions:
+  contents: write
+
+env:
+  TARGET: mediatek/filogic
+  PROFILE: jiorouter_ax6000-jidu6j01
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: defaults बनाएं (स्क्रिप्ट इसी YAML में है)
+        run: |
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99-jiorouter-setup <<'DEFAULTS_EOF'
+          #!/bin/sh
+          # /etc/uci-defaults/99-jiorouter-setup
+          exec >/tmp/setup.log 2>&1
+
+          # =========================================================
+          # WIFI ON — 2.4GHz + 5GHz, no password
+          # =========================================================
+          uci set wireless.@wifi-device[0].disabled='0'
+          uci set wireless.@wifi-iface[0].disabled='0'
+          uci set wireless.@wifi-device[1].disabled='0'
+          uci set wireless.@wifi-iface[1].disabled='0'
+          uci commit wireless
+          wifi reload
+
+          # =========================================================
+          # Custom LED script (RGB mixing + 100M port warning)
+          # =========================================================
+          cat > /usr/bin/led-wan << 'LEDEOF'
+          #!/bin/sh
+          trap 'exit 0' TERM INT
+
+          PING_TARGETS="1.1.1.1 8.8.8.8"
+          STATE_FILE="/tmp/router_led_state"
+          CHECK_PORTS="wan lan1 lan2 lan3 lan4"
+
+          set_led() {
+              color="$1"
+              mode="$2"
+
+              r=0; g=0; b=0
+              case "$color" in
+                  red)              r=1 ;;
+                  green)            g=1 ;;
+                  blue)             b=1 ;;
+                  yellow|amber)     r=1; g=1 ;;
+                  cyan)             g=1; b=1 ;;
+                  magenta|purple)   r=1; b=1 ;;
+                  white)            r=1; g=1; b=1 ;;
+              esac
+
+              for c in red green blue; do
+                  path="/sys/class/leds/${c}:status"
+                  [ -d "$path" ] || continue
+
+                  val=0
+                  [ "$c" = "red" ]   && val=$r
+                  [ "$c" = "green" ] && val=$g
+                  [ "$c" = "blue" ]  && val=$b
+
+                  if [ "$val" -eq 1 ] && [ "$mode" != "off" ]; then
+                      if [ "$mode" = "flash" ]; then
+                          echo timer > "${path}/trigger" 2>/dev/null
+                          echo 500 > "${path}/delay_on" 2>/dev/null
+                          echo 500 > "${path}/delay_off" 2>/dev/null
+                      else
+                          echo none > "${path}/trigger" 2>/dev/null
+                          echo 255 > "${path}/brightness" 2>/dev/null
+                      fi
+                  else
+                      echo none > "${path}/trigger" 2>/dev/null
+                      echo 0 > "${path}/brightness" 2>/dev/null
+                  fi
+              done
+          }
+
+          check_internet() {
+              for target in $PING_TARGETS; do
+                  if ping -c 1 -W 2 "$target" >/dev/null 2>&1; then
+                      return 0
+                  fi
+              done
+              return 1
+          }
+
+          check_port_warning() {
+              for port in $CHECK_PORTS; do
+                  if [ -d "/sys/class/net/$port" ]; then
+                      speed=$(cat "/sys/class/net/$port/speed" 2>/dev/null)
+                      state=$(cat "/sys/class/net/$port/operstate" 2>/dev/null)
+                      if [ "$state" = "up" ] && [ "$speed" = "100" ]; then
+                          return 0
+                      fi
+                  fi
+              done
+              return 1
+          }
+
+          is_upgrading() {
+              pgrep -f "sysupgrade" >/dev/null 2>&1 && return 0
+              [ -e /tmp/sysupgrade ] && return 0
+              [ -e /overlay/.sysupgrade ] && return 0
+              [ -e /tmp/.failsafe ] && return 0
+              [ -f /tmp/sysupgrade.always_force_backup ] && return 0
+              ls /tmp/sysupgrade-* >/dev/null 2>&1 && return 0
+              return 1
+          }
+
+          while true; do
+              if is_upgrading; then
+                  set_led none off
+                  exit 0
+              fi
+
+              if check_internet; then
+                  if check_port_warning; then
+                      TARGET_COLOR="yellow"
+                      TARGET_MODE="flash"
+                  else
+                      TARGET_COLOR="green"
+                      TARGET_MODE="solid"
+                  fi
+              else
+                  TARGET_COLOR="red"
+                  TARGET_MODE="flash"
+              fi
+
+              NEW_STATE="${TARGET_COLOR}_${TARGET_MODE}"
+              OLD_STATE=$(cat "$STATE_FILE" 2>/dev/null)
+
+              if [ "$NEW_STATE" != "$OLD_STATE" ]; then
+                  set_led "$TARGET_COLOR" "$TARGET_MODE"
+                  echo "$NEW_STATE" > "$STATE_FILE"
+              fi
+
+              sleep 5
+          done
+          LEDEOF
+          chmod +x /usr/bin/led-wan
+
+          # =========================================================
+          # Init.d service with procd
+          # =========================================================
+          cat > /etc/init.d/ledwan << 'INITEOF'
+          #!/bin/sh /etc/rc.common
+          START=99
+          STOP=10
+          USE_PROCD=1
+          start_service() {
+              procd_open_instance
+              procd_set_param command /usr/bin/led-wan
+              procd_set_param respawn
+              procd_close_instance
+          }
+          stop_service() {
+              killall led-wan 2>/dev/null
+          }
+          restart() {
+              stop
+              start
+          }
+          INITEOF
+          chmod +x /etc/init.d/ledwan
+          /etc/init.d/ledwan enable
+          /etc/init.d/ledwan start
+
+          # =========================================================
+          # CUSTOM MODEL NAME (auto-detected at runtime)
+          # =========================================================
+          cat > /etc/init.d/custom-model << 'MODELEOF'
+          #!/bin/sh /etc/rc.common
+
+          START=95
+
+          start() {
+              mkdir -p /tmp/sysinfo
+
+              . /lib/functions.sh
+              BOARD=$(board_name)
+              MODEL=""
+
+              case "$BOARD" in
+              jiorouter,ax6000-jidu6101)
+                  MODEL="JioRouter AX6000 JIDU6101"
+                  ;;
+              jiorouter,ax6000-jidu6j01)
+                  mfg_part="$(grep -m1 MFG /proc/mtd | cut -d: -f1)"
+                  DETECTED=""
+                  if [ -n "$mfg_part" ]; then
+                      DETECTED=$(strings "/dev/${mfg_part}" 2>/dev/null | grep -o -m1 'JIDU[0-9A-Z][0-9A-Z]*')
+                  fi
+                  if [ -n "$DETECTED" ]; then
+                      MODEL="JioRouter AX6000 ${DETECTED}"
+                  else
+                      MODEL="JioRouter AX6000 JIDU6201/6401/6601/6701"
+                  fi
+                  ;;
+              *)
+                  MODEL="JioRouter AX6000"
+                  ;;
+              esac
+
+              echo "$MODEL" > /tmp/sysinfo/model
+          }
+          MODELEOF
+          chmod +x /etc/init.d/custom-model
+          /etc/init.d/custom-model enable
+          /etc/init.d/custom-model start
+
+          # =========================================================
+          # CUSTOM BANNER — OpenWrt version is read LIVE from
+          # /etc/openwrt_release at first-boot time (not hardcoded),
+          # so the banner always shows whatever version is actually
+          # running on this build, automatically.
+          # =========================================================
+          OWRT_VER="unknown"
+          if [ -f /etc/openwrt_release ]; then
+              . /etc/openwrt_release
+              OWRT_VER="${DISTRIB_RELEASE:-unknown}"
+          fi
+
+          cat > /etc/banner <<BANNEREOF
+          =============================================================
+          #   #  ###  #   #  ###  #   # ####   ###      # ##### #   #
+          ## ## #   # ##  # #   # #   # #   # #   #     #   #   ##  #
+          # # # ##### # # # ##### #   # ####  #####     #   #   # # #
+          #   # #   # #  ## #   #  # #  #  #  #   # #   #   #   #  ##
+          #   # #   # #   # #   #   #   #   # #   #  ###  ##### #   #
+          =============================================================
+                                Version ${OWRT_VER}
+                          Developer @RichardDawkinsIN
+          =============================================================
+          BANNEREOF
+
+          exit 0
+          DEFAULTS_EOF
+          chmod +x files/etc/uci-defaults/99-jiorouter-setup
+
+      - name: लेटेस्ट वर्शन और टैग तय करें
+        id: ver
+        run: |
+          VER=$(curl -s https://downloads.openwrt.org/.versions.json | jq -r '.stable_version')
+          HASH=$( (cat files/etc/uci-defaults/99-jiorouter-setup; cat packages/pkg.sh 2>/dev/null) | sha256sum | cut -c1-8)
+          echo "ver=$VER" >> $GITHUB_OUTPUT
+          echo "tag=v$VER-$HASH" >> $GITHUB_OUTPUT
+
+      - name: रिलीज़ पहले से है?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.ver.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: ImageBuilder तैयार करें
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd build-essential libncurses-dev zlib1g-dev gawk gettext libssl-dev xsltproc rsync unzip python3
+
+          VER="${{ steps.ver.outputs.ver }}"
+          NAME="openwrt-imagebuilder-$VER-${TARGET//\//-}.Linux-x86_64"
+          BASE="https://downloads.openwrt.org/releases/$VER/targets/$TARGET"
+
+          if curl -fsI "$BASE/$NAME.tar.zst" >/dev/null; then
+            wget -q "$BASE/$NAME.tar.zst"
+            tar --zstd -xf "$NAME.tar.zst"
+          else
+            wget -q "$BASE/$NAME.tar.xz"
+            tar -xJf "$NAME.tar.xz"
+          fi
+          mv "$NAME" ib
+
+      - name: इमेज बनाएं
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          # packages/pkg.sh ज़रूरी नहीं: न हो तो सिर्फ डिफ़ॉल्ट पैकेज के साथ बनेगा
+          PKGS=""
+          if [ -f packages/pkg.sh ]; then
+            PKGS=$(sed 's/#.*//' packages/pkg.sh | tr -s ' \t\r\n' ' ')
+          fi
+          echo "Extra packages: ${PKGS:-(none, default only)}"
+          cd ib
+          make image PROFILE="$PROFILE" PACKAGES="$PKGS" FILES="$GITHUB_WORKSPACE/files"
+
+          mkdir -p ../out
+          cp bin/targets/$TARGET/*sysupgrade* ../out/ 2>/dev/null || true
+          cp bin/targets/$TARGET/*factory* ../out/ 2>/dev/null || true
+          cp bin/targets/$TARGET/sha256sums ../out/ 2>/dev/null || true
+          [ "$(ls -A ../out)" ] || { echo "no images built"; exit 1; }
+          ls -l ../out
+
+      - name: ऑफिशियल OpenWrt से कर्नल फाइल लें
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          VER="${{ steps.ver.outputs.ver }}"
+          BASE="https://downloads.openwrt.org/releases/$VER/targets/$TARGET"
+          curl -fsS "$BASE/profiles.json" -o profiles.json || { echo "profiles.json नहीं मिली"; exit 0; }
+          NAMES=$(jq -r --arg p "$PROFILE" '(.profiles[$p].images // [])[] | select(.type | test("kernel")) | .name' profiles.json)
+          [ -n "$NAMES" ] || echo "WARNING: इस प्रोफ़ाइल की कोई kernel फाइल official में नहीं मिली"
+          for N in $NAMES; do
+            echo "kernel: $N"
+            wget -q -O "out/$N" "$BASE/$N"
+          done
+          ls -l out
+
+      - name: रिलीज़ बनाएं
+        if: steps.check.outputs.exists != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: OpenWrt ${{ steps.ver.outputs.ver }} (JioRouter)
+          files: out/*
